@@ -1,0 +1,678 @@
+diff --git a/autogen.sh b/autogen.sh
+index f5bf3e80..9245439e 100755
+--- a/autogen.sh
++++ b/autogen.sh
+@@ -1,7 +1,7 @@
+ #!/bin/sh
+ 
+-ACLOCAL=aclocal-1.15
+-AUTOMAKE=automake-1.15
++ACLOCAL=aclocal-1.16
++AUTOMAKE=automake-1.16
+ 
+ $ACLOCAL -I ac \
+   && libtoolize --force --copy \
+diff --git a/libsylph/imap.c b/libsylph/imap.c
+index e0bc7d27..9130d294 100644
+--- a/libsylph/imap.c
++++ b/libsylph/imap.c
+@@ -3846,15 +3846,18 @@ static gint imap_cmd_auth_oauth2(IMAPSession *session, const gchar *user,
+ 	gint ok;
+ 
+ 	account = (PrefsAccount *)(SESSION(session)->data);
+-	if (!account->token)
+-		oauth2_get_token(user, &account->token, NULL, NULL);
++
++	g_free(account->token);
++	account->token = NULL;
++	oauth2_get_token(user, &account->token, NULL, NULL);
++
+ 	if (!account->token) {
+ 		log_warning("Could not get OAuth2 token.\n");
+ 		return IMAP_AUTHFAIL;
+ 	}
+ 
+ 	response64 = oauth2_get_sasl_xoauth2(user, account->token);
+-	log_print("IMAP4> %s\n", response64);
++	log_print("IMAP4> ****************\n");
+ 	sock_puts(SESSION(session)->sock, response64);
+ 	ok = imap_cmd_ok(session, NULL);
+ 	if (ok != IMAP_SUCCESS) {
+diff --git a/libsylph/oauth2.c b/libsylph/oauth2.c
+index 7165e198..803bb06e 100644
+--- a/libsylph/oauth2.c
++++ b/libsylph/oauth2.c
+@@ -49,7 +49,14 @@ gint oauth2_get_token   (const gchar     *user,
+ 	argv[1] = (gchar *)user;
+ 	if (g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
+ 			 NULL, NULL, &out, NULL, &status, &error)) {
+-		debug_print("syl-auth-helper out: %s\n", out);
++		if (!g_spawn_check_exit_status(status, &error)) {
++			g_warning("OAuth2 helper failed: %s\n",
++				  error ? error->message : "unknown error");
++			g_clear_error(&error);
++			g_free(out);
++			return -1;
++		}
++
+ 		gchar **lines = g_strsplit(out, "\n", 4);
+ 		if (lines && lines[0] && token) {
+ 			*token = g_strdup(g_strchomp(lines[0]));
+@@ -57,6 +64,7 @@ gint oauth2_get_token   (const gchar     *user,
+ 				*r_token = g_strdup(g_strchomp(lines[1]));
+ 		}
+ 		g_strfreev(lines);
++		g_free(out);
+ 		return 0;
+ 	} else {
+ 		g_warning("OAuth2 helper execution failed.\n");
+diff --git a/libsylph/pop.c b/libsylph/pop.c
+index 868b5317..cea5225d 100644
+--- a/libsylph/pop.c
++++ b/libsylph/pop.c
+@@ -226,8 +226,10 @@ gint pop3_getauth_auth_data_send(Pop3Session *session)
+ 
+ 	session->state = POP3_GETAUTH_AUTH_DATA;
+ 
+-	if (!ac->token)
+-		oauth2_get_token(session->user, &ac->token, NULL, NULL);
++	g_free(ac->token);
++	ac->token = NULL;
++	oauth2_get_token(session->user, &ac->token, NULL, NULL);
++
+ 	if (!ac->token) {
+ 		log_warning("Could not get OAuth2 token.\n");
+ 		session->error_val = PS_AUTHFAIL;
+@@ -235,7 +237,8 @@ gint pop3_getauth_auth_data_send(Pop3Session *session)
+ 	}
+ 
+ 	response64 = oauth2_get_sasl_xoauth2(session->user, ac->token);
+-	pop3_gen_send(session, "%s", response64);
++	session_send_msg(SESSION(session), SESSION_MSG_NORMAL, response64);
++	log_print("POP3> ****************\n");
+ 	g_free(response64);
+ 
+ 	return PS_SUCCESS;
+diff --git a/libsylph/smtp.c b/libsylph/smtp.c
+index bdd0b25a..bfcaa59b 100644
+--- a/libsylph/smtp.c
++++ b/libsylph/smtp.c
+@@ -245,8 +245,12 @@ static gint smtp_auth_recv(SMTPSession *session, const gchar *msg)
+ 		if (!strncmp(msg, "334 ", 4)) {
+ 			gchar *response64;
+ 			PrefsAccount *ac = (PrefsAccount *)SESSION(session)->data;
+-			if (ac && !ac->token)
++			if (ac) {
++				g_free(ac->token);
++				ac->token = NULL;
+ 				oauth2_get_token(session->user, &ac->token, NULL, NULL);
++			}
++
+ 			if (!ac || !ac->token) {
+ 				log_warning("Could not get OAuth2 token.\n");
+ 				session_send_msg(SESSION(session), SESSION_MSG_NORMAL, "*");
+@@ -257,7 +261,7 @@ static gint smtp_auth_recv(SMTPSession *session, const gchar *msg)
+ 			response64 = oauth2_get_sasl_xoauth2(session->user, ac->token);
+ 			session_send_msg(SESSION(session), SESSION_MSG_NORMAL,
+ 					 response64);
+-			log_print("ESMTP> %s\n", response64);
++			log_print("ESMTP> ****************\n");
+ 			g_free(response64);
+ 		}
+ 		break;
+diff --git a/src/syl-auth-helper.c b/src/syl-auth-helper.c
+index 9e38d8a6..62e3f718 100644
+--- a/src/syl-auth-helper.c
++++ b/src/syl-auth-helper.c
+@@ -31,6 +31,7 @@
+ #  include <ws2tcpip.h>
+ #else
+ #  include <sys/socket.h>
++#  include <sys/random.h>
+ #endif /* G_OS_WIN32 */
+ 
+ #include "utils.h"
+@@ -72,7 +73,205 @@ static AcceptData accept_data = {
+ };
+ 
+ static gchar *http_get(const gchar *url, gchar **r_header);
+-static gchar *http_post(const gchar *url, const gchar *req_body, gchar **r_header);
++static gchar *http_post(const gchar *url, const gchar *req_body, gchar **r_header, long *r_status);
++
++static gchar *get_token_cache_path(const gchar *user)
++{
++	gchar *safe_user;
++	gchar *filename;
++	gchar *path;
++
++	if (!user || !*user)
++		return NULL;
++
++	safe_user = g_strdup(user);
++	subst_for_filename(safe_user);
++
++	filename = g_strdup_printf("oauth2-token-%s", safe_user);
++	path = g_strconcat(get_rc_dir(), G_DIR_SEPARATOR_S, filename, NULL);
++
++	g_free(filename);
++	g_free(safe_user);
++
++	return path;
++}
++
++static gchar *load_refresh_token(const gchar *user)
++{
++	gchar *path;
++	gchar *token = NULL;
++	GError *error = NULL;
++
++	path = get_token_cache_path(user);
++	if (!path)
++		return NULL;
++
++	if (!g_file_get_contents(path, &token, NULL, &error)) {
++		if (!g_error_matches(error, G_FILE_ERROR, G_FILE_ERROR_NOENT))
++			g_warning("could not read OAuth2 token cache: %s",
++				  error->message);
++		g_error_free(error);
++		g_free(path);
++		return NULL;
++	}
++
++	g_free(path);
++	g_strstrip(token);
++
++	if (!*token) {
++		g_free(token);
++		return NULL;
++	}
++
++	return token;
++}
++
++static void remove_refresh_token(const gchar *user)
++{
++	gchar *path;
++
++	path = get_token_cache_path(user);
++	if (!path)
++		return;
++
++	if (g_unlink(path) < 0 && errno != ENOENT)
++		FILE_OP_ERROR(path, "unlink");
++
++	g_free(path);
++}
++
++static gint save_refresh_token(const gchar *user, const gchar *token)
++{
++	gchar *path;
++	gchar *tmppath;
++	FILE *fp;
++	gint ret = -1;
++
++	if (!token || !*token)
++		return -1;
++
++	path = get_token_cache_path(user);
++	if (!path)
++		return -1;
++
++	tmppath = g_strconcat(path, ".tmp", NULL);
++
++	fp = g_fopen(tmppath, "wb");
++	if (!fp) {
++		FILE_OP_ERROR(tmppath, "fopen");
++		goto out;
++	}
++
++	if (change_file_mode_rw(fp, tmppath) < 0) {
++		FILE_OP_ERROR(tmppath, "chmod");
++		fclose(fp);
++		g_unlink(tmppath);
++		goto out;
++	}
++
++	if (fputs(token, fp) == EOF || fputc('\n', fp) == EOF) {
++		g_warning("writing OAuth2 token cache failed");
++		fclose(fp);
++		g_unlink(tmppath);
++		goto out;
++	}
++
++	if (fclose(fp) == EOF) {
++		g_warning("closing OAuth2 token cache failed");
++		g_unlink(tmppath);
++		goto out;
++	}
++
++	if (rename_force(tmppath, path) < 0) {
++		FILE_OP_ERROR(path, "rename");
++		g_unlink(tmppath);
++		goto out;
++	}
++
++	ret = 0;
++
++out:
++	g_free(tmppath);
++	g_free(path);
++
++	return ret;
++}
++
++static void base64_to_base64url(gchar *str)
++{
++	gint i;
++
++	for (i = 0; str[i] != '\0'; i++) {
++		if (str[i] == '+')
++			str[i] = '-';
++		else if (str[i] == '/')
++			str[i] = '_';
++		else if (str[i] == '=') {
++			str[i] = '\0';
++			break;
++		}
++	}
++}
++
++static gboolean secure_random_fill(guchar *data, gsize len)
++{
++	gsize offset = 0;
++
++	while (offset < len) {
++		ssize_t n;
++
++		n = getrandom(data + offset, len - offset, 0);
++		if (n < 0) {
++			if (errno == EINTR)
++				continue;
++			return FALSE;
++		}
++
++		if (n == 0)
++			return FALSE;
++
++		offset += n;
++	}
++
++	return TRUE;
++}
++
++static gchar *generate_code_verifier(void)
++{
++	guchar data[32];
++	gchar *str;
++
++	if (!secure_random_fill(data, sizeof(data)))
++		return NULL;
++
++	str = g_malloc(64);
++	base64_encode(str, data, sizeof(data));
++	base64_to_base64url(str);
++
++	return str;
++}
++
++static gchar *generate_code_challenge(const gchar *verifier)
++{
++	GChecksum *checksum;
++	guchar digest[32];
++	gsize digest_len = sizeof(digest);
++	gchar *str;
++
++	checksum = g_checksum_new(G_CHECKSUM_SHA256);
++	if (!checksum)
++		return NULL;
++
++	g_checksum_update(checksum, (const guchar *)verifier, strlen(verifier));
++	g_checksum_get_digest(checksum, digest, &digest_len);
++	g_checksum_free(checksum);
++
++	str = g_malloc(64);
++	base64_encode(str, digest, digest_len);
++	base64_to_base64url(str);
++
++	return str;
++}
+ 
+ static gboolean socket_input_cb(GIOChannel *source, GIOCondition condition,
+ 				gpointer data)
+@@ -112,7 +311,6 @@ static gboolean socket_input_cb(GIOChannel *source, GIOCondition condition,
+ 	g_string_free(res, TRUE);
+ 	fd_close(peersock);
+ 
+-	debug_print("Redirected request:\n%s\n", req->str);
+ 	g_string_free(req, TRUE);
+ 
+ 	p = strstr(getl, "?state=");
+@@ -255,7 +453,7 @@ static gchar *http_get(const gchar *url, gchar **r_header)
+ 	return g_string_free(body, FALSE);
+ }
+ 
+-static gchar *http_post(const gchar *url, const gchar *req_body, gchar **r_header)
++static gchar *http_post(const gchar *url, const gchar *req_body, gchar **r_header, long *r_status)
+ {
+ 	CURL *curl;
+ 	CURLcode res;
+@@ -266,7 +464,6 @@ static gchar *http_post(const gchar *url, const gchar *req_body, gchar **r_heade
+ #endif
+ 
+ 	debug_print("http_post: url: %s\n", url);
+-	debug_print("http_post: body: %s\n", req_body);
+ 
+ 	curl = curl_easy_init();
+ 	if (!curl) {
+@@ -301,6 +498,10 @@ static gchar *http_post(const gchar *url, const gchar *req_body, gchar **r_heade
+ 		curl_easy_cleanup(curl);
+ 		return NULL;
+ 	}
++
++	if (r_status)
++		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, r_status);
++
+ 	curl_easy_cleanup(curl);
+ 
+ 	if (r_header) {
+@@ -311,6 +512,89 @@ static gchar *http_post(const gchar *url, const gchar *req_body, gchar **r_heade
+ 	return g_string_free(body, FALSE);
+ }
+ 
++static gboolean oauth2_error_is_invalid_grant(const gchar *body)
++{
++	const gchar *p;
++
++	if (!body)
++		return FALSE;
++
++	p = strstr(body, "\"error\"");
++	if (!p)
++		return FALSE;
++
++	p += 7;
++	while (g_ascii_isspace(*p))
++		p++;
++
++	if (*p != ':')
++		return FALSE;
++	p++;
++
++	while (g_ascii_isspace(*p))
++		p++;
++
++	if (*p != '\"')
++		return FALSE;
++	p++;
++
++	return !strncmp(p, "invalid_grant\"", 14);
++}
++
++static gchar *oauth2_refresh_access_token(APIInfo *api,
++					       const gchar *refresh_token,
++					       long *r_status)
++{
++	CURL *curl;
++	GString *req_body;
++	gchar *tmp;
++	gchar *header = NULL;
++	gchar *body;
++
++	if (!api || !refresh_token || !*refresh_token)
++		return NULL;
++
++	curl = curl_easy_init();
++	if (!curl)
++		return NULL;
++
++	req_body = g_string_new(NULL);
++
++	tmp = curl_easy_escape(curl, api->client_id, 0);
++	g_string_append_printf(req_body, "client_id=%s", tmp);
++	curl_free(tmp);
++
++	tmp = curl_easy_escape(curl, refresh_token, 0);
++	g_string_append_printf(req_body, "&refresh_token=%s", tmp);
++	curl_free(tmp);
++
++	g_string_append(req_body, "&grant_type=refresh_token");
++
++	if (api->scope && *api->scope) {
++		tmp = curl_easy_escape(curl, api->scope, 0);
++		g_string_append_printf(req_body, "&scope=%s", tmp);
++		curl_free(tmp);
++	}
++
++	if (api->client_secret && *api->client_secret) {
++		tmp = curl_easy_escape(curl, api->client_secret, 0);
++		g_string_append_printf(req_body, "&client_secret=%s", tmp);
++		curl_free(tmp);
++	}
++
++	body = http_post(api->token_uri, req_body->str, &header, r_status);
++
++	if (header) {
++		debug_print("refresh response header:\n%s\n", header);
++		g_free(header);
++	}
++
++	g_string_free(req_body, TRUE);
++	curl_easy_cleanup(curl);
++
++	return body;
++}
++
+ static APIInfo *get_api_info(GKeyFile *key_file, const gchar *address)
+ {
+ 	gchar **groups;
+@@ -385,35 +669,24 @@ static gint parse_token_response(const gchar *body, TokenData *data)
+ 	return 0;
+ }
+ 
+-static gchar *generate_state()
++static gchar *generate_state(void)
+ {
+-	guint32 data[8];
+-	gint i;
++	guchar data[32];
+ 	gchar *str;
+ 
+-	for (i = 0; i < sizeof(data) / sizeof(data[0]); i++) {
+-		data[i] = g_random_int();
+-	}
++	if (!secure_random_fill(data, sizeof(data)))
++		return NULL;
++
++	str = g_malloc(64);
++	base64_encode(str, data, sizeof(data));
++	base64_to_base64url(str);
+ 
+-	str = g_malloc(sizeof(data) * 2 + 1);
+-	base64_encode(str, (guchar *)data, sizeof(data));
+-	/* convert to Base64 URL encoding */
+-	for (i = 0; str[i] != '\0'; i++) {
+-		if (str[i] == '+')
+-			str[i] = '-';
+-		else if (str[i] == '/')
+-			str[i] = '_';
+-		else if (str[i] == '=') {
+-			str[i] = '\0';
+-			break;
+-		}
+-	}
+ 	return str;
+ }
+ 
+ int main(int argc, char *argv[])
+ {
+-	int ret = EXIT_SUCCESS;
++	int ret = EXIT_FAILURE;
+ 	gchar *header = NULL, *body;
+ 	gchar *auth_req_uri;
+ 	GString *auth_uri;
+@@ -425,6 +698,8 @@ int main(int argc, char *argv[])
+ 	GKeyFile *key_file;
+ 	gchar *file;
+ 	TokenData data = {0, 0, NULL, NULL};
++	gchar *refresh_token = NULL;
++	long http_status = 0;
+ 	gint i;
+ 	const gchar *address = NULL;
+ 	APIInfo *api;
+@@ -462,6 +737,8 @@ int main(int argc, char *argv[])
+ 		return EXIT_FAILURE;
+ 	}
+ 
++	refresh_token = load_refresh_token(address);
++
+ 	curl_global_init(CURL_GLOBAL_ALL);
+ 
+ 	curl = curl_easy_init();
+@@ -469,6 +746,51 @@ int main(int argc, char *argv[])
+ 		curl_global_cleanup();
+ 		return EXIT_FAILURE;
+ 	}
++
++	if (refresh_token) {
++		http_status = 0;
++		body = oauth2_refresh_access_token(api, refresh_token, &http_status);
++
++		if (body && http_status >= 200 && http_status < 300 &&
++		    parse_token_response(body, &data) == 0 &&
++		    data.access_token) {
++			if (data.refresh_token)
++				save_refresh_token(address, data.refresh_token);
++
++			fputs(data.access_token, stdout);
++			fputs("\n", stdout);
++
++			g_free(body);
++			g_free(data.access_token);
++			g_free(data.refresh_token);
++			g_free(refresh_token);
++			curl_easy_cleanup(curl);
++			curl_global_cleanup();
++			return EXIT_SUCCESS;
++		}
++
++		if (body && oauth2_error_is_invalid_grant(body)) {
++			remove_refresh_token(address);
++
++			g_free(body);
++			body = NULL;
++			g_free(data.access_token);
++			data.access_token = NULL;
++			g_free(data.refresh_token);
++			data.refresh_token = NULL;
++			g_free(refresh_token);
++			refresh_token = NULL;
++		} else {
++			g_free(body);
++			g_free(data.access_token);
++			g_free(data.refresh_token);
++			g_free(refresh_token);
++			curl_easy_cleanup(curl);
++			curl_global_cleanup();
++			return EXIT_FAILURE;
++		}
++	}
++
+ 	auth_uri = g_string_new(api->auth_uri);
+ 	g_string_append(auth_uri, "?response_type=code");
+ 	g_string_append_printf(auth_uri, "&client_id=%s", api->client_id);
+@@ -479,7 +801,31 @@ int main(int argc, char *argv[])
+ 	g_string_append_printf(auth_uri, "&scope=%s", tmp);
+ 	curl_free(tmp);
+ 	state = generate_state();
++	if (!state) {
++		g_warning("could not generate OAuth2 state");
++		g_string_free(auth_uri, TRUE);
++		curl_easy_cleanup(curl);
++		curl_global_cleanup();
++		return EXIT_FAILURE;
++	}
+ 	g_string_append_printf(auth_uri, "&state=%s", state);
++
++	gchar *code_verifier = generate_code_verifier();
++	gchar *code_challenge = code_verifier ? generate_code_challenge(code_verifier) : NULL;
++	if (!code_verifier || !code_challenge) {
++		g_warning("could not generate PKCE parameters");
++		g_free(code_verifier);
++		g_free(code_challenge);
++		g_free(state);
++		g_string_free(auth_uri, TRUE);
++		curl_easy_cleanup(curl);
++		curl_global_cleanup();
++		return EXIT_FAILURE;
++	}
++	g_string_append_printf(auth_uri, "&code_challenge=%s", code_challenge);
++	g_free(code_challenge);
++	code_challenge = NULL;
++	g_string_append(auth_uri, "&code_challenge_method=S256");
+ 	g_string_append(auth_uri, "&access_type=offline");
+ 
+ 	debug_print("url: %s\n", auth_uri->str);
+@@ -488,11 +834,12 @@ int main(int argc, char *argv[])
+ 
+ 	code = http_redirect_accept(api->local_port, state);
+ 	if (!code) {
++		g_free(code_verifier);
++		g_free(state);
+ 		curl_easy_cleanup(curl);
+ 		curl_global_cleanup();
+ 		return EXIT_FAILURE;
+ 	}
+-	debug_print("code: %s\n",code);
+ 
+ 	req_body = g_string_new(NULL);
+ 	g_string_append_printf(req_body, "client_id=%s", api->client_id);
+@@ -505,11 +852,18 @@ int main(int argc, char *argv[])
+ 	g_string_append_printf(req_body, "&redirect_uri=%s", tmp);
+ 	curl_free(tmp);
+ 	g_string_append(req_body, "&grant_type=authorization_code");
+-	tmp = curl_easy_escape(curl, api->client_secret, 0);
+-	g_string_append_printf(req_body, "&client_secret=%s", tmp);
++	tmp = curl_easy_escape(curl, code_verifier, 0);
++	g_string_append_printf(req_body, "&code_verifier=%s", tmp);
+ 	curl_free(tmp);
++	g_free(code_verifier);
++	code_verifier = NULL;
++	if (api->client_secret && *api->client_secret) {
++		tmp = curl_easy_escape(curl, api->client_secret, 0);
++		g_string_append_printf(req_body, "&client_secret=%s", tmp);
++		curl_free(tmp);
++	}
+ 
+-	body = http_post(api->token_uri, req_body->str, &header);
++	body = http_post(api->token_uri, req_body->str, &header, NULL);
+ 	if (!header && !body) {
+ 		g_warning("could not get token");
+ 	}
+@@ -518,16 +872,20 @@ int main(int argc, char *argv[])
+ 		g_free(header);
+ 	}
+ 	if (body) {
+-		debug_print("token response body:\n%s\n\n", body);
+-		parse_token_response(body, &data);
+-		if (data.access_token) {
++		if (parse_token_response(body, &data) == 0 &&
++		    data.access_token) {
++			if (data.refresh_token)
++				save_refresh_token(address, data.refresh_token);
++
+ 			fputs(data.access_token, stdout);
+ 			fputs("\n", stdout);
++			ret = EXIT_SUCCESS;
++		} else {
++			g_warning("OAuth2 token response did not contain a valid access token");
+ 		}
+-		if (data.refresh_token) {
+-			fputs(data.refresh_token, stdout);
+-			fputs("\n", stdout);
+-		}
++
++		g_free(data.access_token);
++		g_free(data.refresh_token);
+ 		g_free(body);
+ 	}
+ 	g_string_free(req_body, TRUE);

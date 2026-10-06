@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Modernizing Sylpheed OAuth2 — Black Wolf Tech Notes</title>
+<style>
+:root{--bg:#071018;--p:#0d1924;--p2:#101f2d;--t:#d8ecff;--m:#8fb4d4;--a:#67c1ff;--g:#79d99a;--w:#ffd479;--b:#ff8d8d;--bd:#24445d;--c:#050b10}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:17px/1.68 system-ui,sans-serif}main{max-width:1050px;margin:auto;padding:28px 22px 80px}
+header{padding:50px 0 32px;border-bottom:1px solid var(--bd)}.ey{color:var(--a);font-weight:800;letter-spacing:.12em;text-transform:uppercase;font-size:.8rem}
+h1{font-size:clamp(2.2rem,6vw,4.4rem);line-height:1.03;margin:.2em 0}h2{font-size:2rem;margin-top:2.1em;border-bottom:1px solid var(--bd);padding-bottom:.25em}h3{color:var(--a)}
+.lead{font-size:1.23rem;color:#b9d9f4}.card{background:linear-gradient(145deg,var(--p),var(--p2));border:1px solid var(--bd);border-radius:14px;padding:20px 24px;margin:20px 0}
+.good{border-left:5px solid var(--g)}.warn{border-left:5px solid var(--w)}.bad{border-left:5px solid var(--b)}
+code{background:var(--c);border:1px solid #173247;border-radius:5px;padding:.08em .35em;color:#c7e8ff}pre{background:var(--c);border:1px solid var(--bd);border-radius:10px;padding:17px;overflow:auto;color:#d7efff}
+table{border-collapse:collapse;width:100%;margin:20px 0;background:var(--p)}th,td{border:1px solid var(--bd);padding:11px 13px;text-align:left;vertical-align:top}th{background:#13283a;color:var(--a)}
+.small{font-size:.9rem;color:var(--m)}footer{margin-top:60px;padding-top:25px;border-top:1px solid var(--bd);color:var(--m)}
+@media print{body{background:white;color:black;font-size:11pt}.card,pre,table{break-inside:avoid;background:white;color:black}code,pre{color:black;background:#f3f3f3}}
+</style></head><body><main>
+<header><div class="ey">Black Wolf Tech Notes • Engineering Postmortem</div>
+<h1>Modernizing Sylpheed OAuth2 — and the Cloud Wall That Stopped the Test</h1>
+<p class="lead">A source-level modernization of Sylpheed’s unfinished OAuth2/XOAUTH2 path on AlmaLinux 9.8: PKCE, public-client authentication, secure state generation, refresh-token caching and rotation, safer logging, protocol integration, and helper-process failure handling. The code built successfully. The final Microsoft test did not fail in C, TLS, IMAP, or OAuth protocol code—it stopped at Microsoft’s app-registration/tenant enrollment process.</p></header>
+
+<h2>1. Why This Work Started</h2>
+<p>The original goal was simple: configure a Microsoft Hotmail/Outlook account in Sylpheed. The existing Sylpheed 3.7 installation already handled ordinary mail and Gmail after a separate TLS SNI compatibility fix.</p>
+<p>Microsoft IMAP connectivity itself worked. Sylpheed established TLS 1.3 to <code>outlook.office365.com:993</code>, validated the certificate and received the server capability list:</p>
+<pre><code>* CAPABILITY IMAP4 IMAP4rev1 AUTH=XOAUTH2 LOGINDISABLED ...</code></pre>
+<p><code>LOGINDISABLED</code> meant the traditional username/password LOGIN path could not authenticate. An application password could not fix a mechanism the server refused to offer. Microsoft required XOAUTH2.</p>
+<div class="card good"><strong>Not a TLS problem:</strong> SNI worked, TLS worked, certificate verification worked, hostname validation worked and the Microsoft IMAP server answered normally. Authentication policy was the barrier.</div>
+
+<h2>2. Protect the Known-Good Client</h2>
+<p>The working 3.7 source and installed mail client were deliberately left untouched. OAuth work was done in a separate upstream Git tree based on Sylpheed 3.8.0beta1. The experimental build was never installed over the working 3.7 system.</p>
+
+<h2>3. What Upstream Already Had</h2>
+<p>Upstream contained real but incomplete OAuth machinery: <code>libsylph/oauth2.c</code>, XOAUTH2 paths in IMAP/POP3/SMTP, <code>syl-auth-helper</code>, an <code>oauth2.ini.sample</code>, browser authorization-code handling, token parsing, and account fields for access token, refresh token and expiry.</p>
+<p>The SASL form was already essentially:</p>
+<pre><code>base64("user=" + username + "\x01auth=Bearer " + access_token + "\x01\x01")</code></pre>
+<p>The problem was not absence of OAuth code. It was an unfinished lifecycle and an older OAuth model.</p>
+
+<h2>4. Gaps Found and Changes Made</h2>
+<table><tr><th>Area</th><th>Upstream</th><th>Test-branch work</th></tr>
+<tr><td>Desktop/public client</td><td>Token exchange expected a client secret.</td><td>Made client secret optional and added PKCE.</td></tr>
+<tr><td>PKCE</td><td>Absent.</td><td>Added verifier, SHA-256 challenge and S256 authorization parameters.</td></tr>
+<tr><td>OAuth state</td><td>Used GLib pseudo-random integers.</td><td>Used kernel cryptographic randomness on the Alma/Linux implementation.</td></tr>
+<tr><td>Refresh lifecycle</td><td>Refresh token parsed but callers discarded it; no complete persistence/use path.</td><td>Implemented helper-owned private refresh-token cache and refresh grant.</td></tr>
+<tr><td>Protocol use</td><td>Access token could remain in memory.</td><td>IMAP, POP3 and SMTP discard the old token and request a current one before OAuth auth.</td></tr>
+<tr><td>Logging</td><td>Debug paths could expose tokens, codes, response bodies or SASL material.</td><td>Removed/redacted secret-bearing logging.</td></tr>
+<tr><td>Helper status</td><td>Child exit status captured but ignored.</td><td>Added <code>g_spawn_check_exit_status()</code>.</td></tr>
+<tr><td>Memory</td><td>Helper stdout allocation not freed on normal success.</td><td>Freed it after parsing.</td></tr></table>
+
+<h2>5. Getting the Upstream Tree to Build</h2>
+<p>The Git tree used <code>autogen.sh</code>. Its Automake commands were pinned to 1.15 while Alma supplied 1.16, so the experimental tree was adjusted to use the available toolchain. Configuration initially stopped because the GPGME Autoconf macro was absent; the matching development package supplied it. The matching libcurl development package was also installed for the OAuth helper.</p>
+<p>Configuration then detected GLib 2.68.4, GTK+ 2.24.33, GPGME, OpenSSL and libcurl, and generated a build that included <code>syl-auth-helper</code>.</p>
+
+<h2>6. PKCE and Public-Client Authentication</h2>
+<p>A desktop application cannot safely hide a compiled-in client secret. The test implementation therefore added PKCE. It generates 32 cryptographically random bytes, Base64URL encodes the verifier, computes SHA-256 over it, and Base64URL encodes that digest as the challenge.</p>
+<pre><code>code_challenge=&lt;SHA256-base64url(verifier)&gt;
+code_challenge_method=S256</code></pre>
+<p>The token request then sends:</p>
+<pre><code>grant_type=authorization_code
+code_verifier=&lt;original verifier&gt;</code></pre>
+<p><code>client_secret</code> became optional, allowing a proper public-client configuration.</p>
+
+<h2>7. Secure Randomness and OAuth State</h2>
+<p>On the Alma/Linux test implementation, PKCE and OAuth state use <code>getrandom(2)</code>. The helper handles interrupted calls and partial reads rather than assuming one call fills the buffer. The older state generator based on <code>g_random_int()</code> was replaced with 32 random bytes encoded as Base64URL. Failure to obtain secure randomness aborts the authorization attempt.</p>
+
+<h2>8. Refresh Tokens: Completing the Missing Lifecycle</h2>
+<p>Upstream had refresh-token-related fields but did not actually complete the lifecycle. Rather than spreading expiry and persistence logic through Sylpheed’s account preferences, the test branch uses a helper-owned model: whenever a protocol needs OAuth authentication, <code>syl-auth-helper</code> obtains a usable access token. If a private cached refresh token exists, the helper performs the refresh grant first.</p>
+<p>The cache is per account under Sylpheed’s configuration directory. The writer uses a temporary file, restricts permissions to the user, writes the token and atomically renames the file into place.</p>
+<p>Refresh failure policy:</p>
+<ul><li><strong>Success:</strong> return access token and save a rotated refresh token if supplied.</li>
+<li><strong>Explicit <code>invalid_grant</code>:</strong> remove the stale cache and fall through to browser authorization.</li>
+<li><strong>Transient/network/other failure:</strong> preserve the cached refresh token and fail the attempt rather than destroying credentials or repeatedly launching a browser.</li></ul>
+
+<h2>9. IMAP, POP3 and SMTP Integration</h2>
+<p>Each protocol now frees its old in-memory access token and asks the helper for a current one immediately before OAuth authentication:</p>
+<pre><code>g_free(account-&gt;token);
+account-&gt;token = NULL;
+oauth2_get_token(user, &amp;account-&gt;token, NULL, NULL);
+
+if (!account-&gt;token) {
+    /* authentication cannot proceed */
+}</code></pre>
+<p>This keeps refresh-token ownership out of the mail protocol implementations and avoids requiring each protocol to understand expiry.</p>
+
+<h2>10. Secret-Bearing Debug Output Removed</h2>
+<p>Review found debug paths capable of exposing authorization codes, token response bodies, helper stdout, HTTP POST bodies, redirect data or XOAUTH2 SASL payloads. These were removed or redacted. Refresh tokens are not intentionally printed to stdout; helper stdout is reserved for the access token requested by the parent process.</p>
+<div class="card warn"><strong>Development note:</strong> historical checkpoint files can contain earlier code. A security grep of the development tree must distinguish active source from backups.</div>
+
+<h2>11. Helper Exit-Status Bug</h2>
+<p>A late audit found that <code>oauth2_get_token()</code> used <code>g_spawn_sync()</code> and captured <code>status</code> without checking whether the helper actually exited successfully. A successful spawn is not an OAuth success.</p>
+<pre><code>if (!g_spawn_check_exit_status(status, &amp;error)) {
+    g_warning("OAuth2 helper failed: %s\n",
+              error ? error-&gt;message : "unknown error");
+    g_clear_error(&amp;error);
+    g_free(out);
+    return -1;
+}</code></pre>
+<p>The normal-success path was also corrected to free the helper-output allocation. The affected library rebuilt cleanly with <code>make -C libsylph -j2</code>.</p>
+
+<h2>12. Full Build Result</h2>
+<p>The complete experimental tree was built with <code>make -j2</code>. The OAuth helper, Sylpheed libraries, main executable and plugins linked successfully, translations generated, and the top-level build returned normally.</p>
+<div class="card good"><strong>Result:</strong> the OAuth modernization was not stopped by a compiler or linker failure. The full experimental tree built successfully.</div>
+<p>After generated Autotools churn was restored, the intentional tracked modification set was limited to:</p>
+<pre><code>autogen.sh
+libsylph/imap.c
+libsylph/oauth2.c
+libsylph/pop.c
+libsylph/smtp.c
+src/syl-auth-helper.c</code></pre>
+
+<h2>13. Microsoft Configuration the Client Was Preparing to Use</h2>
+<p>The upstream sample pointed Microsoft OAuth at the common v2 authorization/token endpoints with a localhost redirect and delegated mail scopes. The intended scope set included offline access plus POP, IMAP and SMTP permissions:</p>
+<pre><code>offline_access
+https://outlook.office.com/POP.AccessAsUser.All
+https://outlook.office.com/IMAP.AccessAsUser.All
+https://outlook.office.com/SMTP.Send</code></pre>
+<p>Hotmail/Live wildcard sections would also be needed in <code>oauth2.ini</code>; an <code>*@outlook.com</code> rule does not match Hotmail or Live addresses.</p>
+
+<h2>14. What Actually Stopped the Live Test</h2>
+<div class="card bad"><strong>The live test did not stop because XOAUTH2 failed.</strong><br>
+It did not stop because PKCE failed.<br>It did not stop because refresh-token handling failed.<br>
+It did not stop because IMAP or TLS failed.<br><br><strong>The live OAuth exchange was never reached.</strong></div>
+<p>A real authorization attempt required a Microsoft application registration and therefore a client ID. Trying to reach app registration with the existing personal Microsoft account led into Microsoft Entra tenant infrastructure. The account was presented with the “Microsoft Services” tenant but did not have access to it.</p>
+<p>The Azure route then led toward obtaining the tenant/subscription context needed for app registration. Enrollment reached payment/card verification, where the bank card was rejected even though the user reported that the same payment methods had long worked for other Microsoft services, including Xbox. The cardholder-name verification became the practical stopping point.</p>
+<p>The decision was made not to keep submitting cards or changing valid identity information merely to obtain an OAuth client ID for one consumer mailbox.</p>
+<div class="card warn"><strong>Accuracy boundary:</strong> this is a successful build report, not a claim of successful end-to-end Microsoft OAuth. No Microsoft app client ID was obtained, so the modified client never reached a live authorization/token exchange.</div>
+
+<h2>15. Why the Work Still Matters</h2>
+<p>The investigation produced useful engineering regardless of the abandoned Hotmail goal: PKCE, public-client behavior, cryptographically strong state on Linux, refresh-token caching and rotation, explicit <code>invalid_grant</code> recovery, protection against transient refresh failures, protocol reauthentication, safer logging, child-process failure handling, and a successful full build.</p>
+<p>It also established a clean failure boundary: the source work reached a compilable checkpoint; the provider-side administrative onboarding prevented final validation.</p>
+
+<h2>16. Known Limitations Before Calling It Upstream-Ready</h2>
+<ul><li><strong>Windows portability:</strong> the secure-random patch currently depends on Linux <code>getrandom()</code>; a portable upstream patch needs a secure Windows implementation.</li>
+<li><strong>Token parser:</strong> the existing response parser is simple and could be hardened.</li>
+<li><strong>Cache-save errors:</strong> stronger reporting/recovery would improve robustness.</li>
+<li><strong>Provider configuration:</strong> Microsoft domain patterns and final settings still require live validation.</li>
+<li><strong>Microsoft end-to-end test:</strong> not performed because app registration/client ID was not obtained.</li>
+<li><strong>Patch cleanup:</strong> experimental checkpoint files must not be included in a real upstream patch series.</li></ul>
+
+<h2>17. Development Method</h2>
+<p>The work was deliberately incremental. Source checkpoints were taken before and after PKCE helpers, PKCE wiring, public-client changes, logging cleanup, cache I/O, HTTP status plumbing, refresh grants, OAuth error parsing, refresh policy, protocol integration, secure randomness, secure state, cleanup paths and helper exit-status handling. A bad edit could therefore be reversed without risking the known-good installed mail client.</p>
+
+<h2>18. Bottom Line</h2>
+<div class="card good"><strong>Code result:</strong> successful.<br><strong>Full experimental build:</strong> successful.<br>
+<strong>Working Sylpheed 3.7 install:</strong> preserved.<br><strong>Microsoft IMAP/TLS connectivity:</strong> successful.<br>
+<strong>Microsoft app registration/client ID:</strong> not obtained.<br><strong>Live Microsoft OAuth:</strong> therefore not reached.</div>
+<p>The precise conclusion is not “Microsoft OAuth failed.” It is:</p>
+<div class="card"><strong>The modified OAuth client built successfully, but the end-to-end Microsoft test was abandoned before authorization because the required Microsoft application registration could not be completed through the available account/enrollment path.</strong></div>
+
+<footer><strong>Black Wolf Tech Notes</strong><p class="small">Source-level troubleshooting, reproducible experiments, and honest failure boundaries. This public write-up intentionally omits passwords, tokens, authorization codes, client secrets, private email addresses, usernames, hostnames and machine-specific home paths.</p></footer>
+</main></body></html>
